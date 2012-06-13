@@ -145,7 +145,9 @@ def canonical_string(req):
     for k in sorted(key.lower() for key in amz_headers):
         buf += "%s:%s\n" % (k, amz_headers[k])
 
-    path = req.path_qs
+    #path = req.path_qs
+    # Using req.path_qs here produces bug lp:936998, remove fallback in 2015
+    path = req.environ.get('RAW_PATH_INFO', req.path_qs)
     if '?' in path:
         path, args = path.split('?', 1)
         for key in urlparse.parse_qs(args, keep_blank_values=True):
@@ -453,7 +455,8 @@ class Swift3Middleware(object):
             return get_err_response('InvalidArgument')(env, start_response)
 
         try:
-            controller, path_parts = self.get_controller(req.path)
+            #controller, path_parts = self.get_controller(req.path)
+            controller, path_parts = self.get_controller(req.path_info)
         except ValueError:
             return get_err_response('InvalidURI')(env, start_response)
 

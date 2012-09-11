@@ -57,12 +57,14 @@ import urlparse
 
 from webob import Request, Response
 from simplejson import loads
+import email.utils
+import datetime
 
 from swift.common.utils import split_path
 from swift.common.wsgi import WSGIContext
 from swift.common.http import HTTP_OK, HTTP_CREATED, HTTP_ACCEPTED, \
     HTTP_NO_CONTENT, HTTP_BAD_REQUEST, HTTP_UNAUTHORIZED, HTTP_FORBIDDEN, \
-    HTTP_NOT_FOUND, HTTP_CONFLICT, is_success
+    HTTP_NOT_FOUND, HTTP_CONFLICT, HTTP_UNPROCESSABLE_ENTITY, is_success
 
 
 MAX_BUCKET_LISTING = 1000
@@ -88,11 +90,16 @@ def get_err_response(code):
             (HTTP_BAD_REQUEST, 'The specified bucket is not valid'),
         'InvalidURI':
             (HTTP_BAD_REQUEST, 'Could not parse the specified URI'),
+        'InvalidDigest':
+            (HTTP_BAD_REQUEST, 'The Content-MD5 you specified was invalid'),
         'NoSuchBucket':
             (HTTP_NOT_FOUND, 'The specified bucket does not exist'),
         'SignatureDoesNotMatch':
             (HTTP_FORBIDDEN, 'The calculated request signature does not '\
             'match your provided one'),
+        'RequestTimeTooSkewed':
+            (HTTP_FORBIDDEN, 'The difference between the request time and '\
+                 ' the current time is too large'),
         'NoSuchKey':
             (HTTP_NOT_FOUND, 'The resource you requested does not exist')}
 
@@ -326,7 +333,17 @@ class ObjectController(WSGIContext):
                                              object_name)
 
     def GETorHEAD(self, env, start_response):
+        if env['REQUEST_METHOD'] == 'HEAD':
+            head = True
+            env['REQUEST_METHOD'] = 'GET'
+        else:
+            head = False
+
         app_iter = self._app_call(env)
+
+        if head:
+            app_iter = None
+
         status = self._get_status_int()
         headers = dict(self._response_headers)
 
@@ -376,7 +393,14 @@ class ObjectController(WSGIContext):
                 del env[key]
                 env['HTTP_X_OBJECT_META_' + key[16:]] = value
             elif key == 'HTTP_CONTENT_MD5':
-                env['HTTP_ETAG'] = value.decode('base64').encode('hex')
+                if value == '':
+                    return get_err_response('InvalidDigest')
+                try:
+                    env['HTTP_ETAG'] = value.decode('base64').encode('hex')
+                except:
+                    return get_err_response('InvalidDigest')
+                if env['HTTP_ETAG'] == '':
+                    return get_err_response('SignatureDoesNotMatch')
             elif key == 'HTTP_X_AMZ_COPY_SOURCE':
                 env['HTTP_X_COPY_FROM'] = value
 
@@ -388,6 +412,8 @@ class ObjectController(WSGIContext):
                 return get_err_response('AccessDenied')
             elif status == HTTP_NOT_FOUND:
                 return get_err_response('NoSuchBucket')
+            elif status == HTTP_UNPROCESSABLE_ENTITY:
+                return get_err_response('InvalidDigest')
             else:
                 return get_err_response('InvalidURI')
 
@@ -449,9 +475,16 @@ class Swift3Middleware(object):
             return self.app(env, start_response)
 
         try:
-            account, signature = \
-                req.headers['Authorization'].split(' ')[-1].rsplit(':', 1)
-        except Exception:
+            keyword, info = req.headers['Authorization'].split(' ')
+        except:
+            return get_err_response('AccessDenied')(env, start_response)
+
+        if keyword != 'AWS':
+            return get_err_response('AccessDenied')(env, start_response)
+
+        try:
+            account, signature = info.rsplit(':', 1)
+        except:
             return get_err_response('InvalidArgument')(env, start_response)
 
         try:
@@ -459,6 +492,22 @@ class Swift3Middleware(object):
             controller, path_parts = self.get_controller(req.path_info)
         except ValueError:
             return get_err_response('InvalidURI')(env, start_response)
+
+        if 'Date' in req.headers:
+            date = email.utils.parsedate(req.headers['Date'])
+            if date == None:
+                return get_err_response('AccessDenied')(env, start_response)
+
+            d1 = datetime.datetime(*date[0:6])
+            d2 = datetime.datetime.utcnow()
+            epoch = datetime.datetime(1970, 1, 1, 0, 0, 0, 0)
+
+            if d1 < epoch:
+                return get_err_response('AccessDenied')(env, start_response)
+
+            delta = datetime.timedelta(seconds=60 * 10)
+            if d1 - d2 > delta or d2 - d1 > delta:
+                return get_err_response('RequestTimeTooSkewed')(env, start_response)
 
         token = base64.urlsafe_b64encode(canonical_string(req))
 
